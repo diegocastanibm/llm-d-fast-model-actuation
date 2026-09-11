@@ -41,6 +41,7 @@ sys.modules["vllm.entrypoints.serve.utils.api_utils"] = MagicMock()
 # Import the application and classes
 from launcher import (  # noqa: E402
     MAX_LOG_RESPONSE_BYTES,
+    ChildSurvivedKill,
     EventBroadcaster,
     HalfMade,
     LogRangeNotAvailable,
@@ -750,6 +751,59 @@ class TestAsyncStop:
         assert result["status"] == "stopped"
         assert manager.instances == {}
 
+    @patch("launcher.POST_KILL_JOIN_TIMEOUT", 0.3)
+    @patch("launcher.os.killpg")
+    @patch("launcher.multiprocessing.Process")
+    def test_stop_async_reports_a_child_that_survives_sigkill(
+        self, mock_process_class, mock_killpg, manager, vllm_config
+    ):
+        """A child that outlives the SIGKILL must fail loudly, without stalling.
+
+        Two things have to hold on this path, and neither is covered by the other
+        tests: the loop must keep running while we wait (a bounded wait is not the
+        same as a non-blocking one), and the instance must not be reported stopped
+        and dropped, or the caller would be told a still-running process had gone
+        and could reuse its id.
+        """
+        proc = SlowExitProcess(3600)  # outlives everything, SIGKILL included
+        mock_process_class.return_value = proc
+        mock_killpg.return_value = None  # the group does not die
+
+        async def run():
+            manager.create_instance(vllm_config, "immortal-id")
+            gaps = []
+
+            async def ticker():
+                previous = time.monotonic()
+                while True:
+                    await asyncio.sleep(0.01)
+                    now = time.monotonic()
+                    gaps.append(now - previous)
+                    previous = now
+
+            task = asyncio.create_task(ticker())
+            try:
+                with pytest.raises(ChildSurvivedKill):
+                    await manager.stop_instance_async("immortal-id", timeout=0.1)
+                # Let the ticker run once more.  The exception propagates without
+                # yielding, so without this the gap that a blocking reap caused
+                # would never get recorded and this test would pass either way.
+                await asyncio.sleep(0.01)
+            finally:
+                task.cancel()
+            return gaps
+
+        try:
+            gaps = asyncio.run(run())
+        finally:
+            proc.close()
+
+        # A blocking reap would show up as one long gap between ticks.
+        assert max(gaps) < 0.15, f"the loop stalled for {max(gaps):.2f}s"
+        # The instance is still ours to deal with, and still watched.
+        assert "immortal-id" in manager.instances
+        assert manager.instances["immortal-id"]._sentinel_active
+
     @patch("launcher.multiprocessing.Process")
     def test_stop_all_instances_async_stops_them_concurrently(
         self, mock_process_class, manager, vllm_config
@@ -775,6 +829,41 @@ class TestAsyncStop:
         assert manager.instances == {}
         # Sequentially this would be ~3x SLOW_EXIT_SECS.
         assert elapsed < 2 * SLOW_EXIT_SECS, f"stopping three took {elapsed:.2f}s"
+
+    @patch("launcher.POST_KILL_JOIN_TIMEOUT", 0.1)
+    @patch("launcher.os.killpg")
+    @patch("launcher.multiprocessing.Process")
+    def test_stop_all_instances_async_reports_the_ones_that_failed(
+        self, mock_process_class, mock_killpg, manager, vllm_config
+    ):
+        """A bulk delete must stop what it can, then admit what it could not.
+
+        Reporting "all_stopped" with a 200 while an instance is still running and
+        still tracked would leave the caller with no way to find out.
+        """
+        cooperative = SlowExitProcess(0.05)
+        immortal = SlowExitProcess(3600)
+        mock_process_class.side_effect = [cooperative, immortal]
+        mock_killpg.return_value = None  # the immortal one's group does not die
+
+        async def run():
+            manager.create_instance(vllm_config, "good-id")
+            manager.create_instance(vllm_config, "immortal-id")
+            with pytest.raises(ExceptionGroup) as caught:
+                await manager.stop_all_instances_async(timeout=0.2)
+            return caught.value
+
+        try:
+            group = asyncio.run(run())
+        finally:
+            cooperative.close()
+            immortal.close()
+
+        # The failure did not stop the others from being stopped...
+        assert "good-id" not in manager.instances
+        # ...and the one that failed is still there to be dealt with.
+        assert "immortal-id" in manager.instances
+        assert [type(exn) for exn in group.exceptions] == [ChildSurvivedKill]
 
 
 class TestAPIEndpoints:

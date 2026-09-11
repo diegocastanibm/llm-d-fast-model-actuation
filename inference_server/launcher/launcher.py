@@ -167,6 +167,25 @@ class HalfMade(Exception):
         self.instance_id = instance_id
 
 
+class ChildSurvivedKill(Exception):
+    """Raised when a vLLM process outlived the SIGKILL of its process group.
+
+    Reporting the instance as terminated would be a lie with consequences: the
+    caller would be told the GPU is free, the instance would be forgotten, and a
+    new one could be created with the same id while the old process is still
+    running.  Failing instead keeps the instance tracked so the operation can be
+    retried.
+    """
+
+    def __init__(self, instance_id, pid, waited):
+        super().__init__(
+            f"vLLM process {pid} of instance {instance_id} was still alive"
+            f" {waited}s after SIGKILL of its process group"
+        )
+        self.instance_id = instance_id
+        self.pid = pid
+
+
 def dump_process_group(subject: str, pgpid: int, when: str) -> None:
     members = []
     for proc in psutil.process_iter(attrs=["pid", "ppid", "name"]):
@@ -318,18 +337,26 @@ class VllmInstance:
             dump_process_group(self.instance_id, vllm_pid, "between killpg and wait")
 
     def _finish_stop(self, vllm_pid: int, took_hard_path: bool) -> dict:
-        """Finish stopping: report what happened and clean up."""
+        """Finish stopping: report what happened and clean up.
+
+        :raises ChildSurvivedKill: if the child outlived the SIGKILL of its group,
+            in which case nothing is cleaned up and no state is reported, because
+            the instance is not in fact stopped.
+        """
         if took_hard_path:
             if self.process.is_alive():
                 logger.error(
                     f"In stop({self.instance_id}), still alive"
                     f" {POST_KILL_JOIN_TIMEOUT}s after SIGKILL of the process"
-                    f" group; giving up on reaping it"
+                    f" group; leaving the instance in place rather than reporting"
+                    f" it stopped"
                 )
-            else:
-                logger.debug(
-                    f"In stop({self.instance_id}), the child exited after the killpg"
+                raise ChildSurvivedKill(
+                    self.instance_id, vllm_pid, POST_KILL_JOIN_TIMEOUT
                 )
+            logger.debug(
+                f"In stop({self.instance_id}), the child exited after the killpg"
+            )
         else:
             logger.debug(f"In stop({self.instance_id}), SIGTERM alone was enough")
 
@@ -409,10 +436,12 @@ class VllmInstance:
         took_hard_path = not exited
         if took_hard_path:
             self._kill_process_group(vllm_pid)
-            await self._await_exit(POST_KILL_JOIN_TIMEOUT)
-        # Reap the child.  This cannot block: either the sentinel became readable,
-        # which means the child is already gone, or it did not and join() is bounded.
-        self.process.join(timeout=POST_KILL_JOIN_TIMEOUT if took_hard_path else 0)
+            exited = await self._await_exit(POST_KILL_JOIN_TIMEOUT)
+        # Reap the child, without ever blocking the loop.  A zero timeout makes
+        # this a WNOHANG waitpid: it collects the child when the sentinel is
+        # readable and returns immediately when it is not, which is the case this
+        # method must not stall on -- a child that outlived even the SIGKILL.
+        self.process.join(timeout=0)
         return self._finish_stop(vllm_pid, took_hard_path)
 
     def _on_sentinel_exit(self):
@@ -681,7 +710,13 @@ class VllmMultiProcessManager:
         """
         async with self._instance_lock(instance_id):
             instance = self._stop_begin(instance_id)
-            await instance.stop_async(timeout)
+            try:
+                await instance.stop_async(timeout)
+            except Exception:
+                # _stop_begin cancelled the sentinel watcher; since the instance
+                # stays tracked, put it back so its eventual exit is still noticed.
+                instance.start_sentinel_watcher(self._on_instance_stopped)
+                raise
             return self._stop_end(instance)
 
     async def create_instance_async(
@@ -711,13 +746,24 @@ class VllmMultiProcessManager:
             return_exceptions=True,
         )
         results = []
+        failures = []
         for instance_id, outcome in zip(instance_ids, settled):
             if isinstance(outcome, KeyError):
                 continue  # Instance was already removed
             if isinstance(outcome, BaseException):
                 logger.error(f"Failed to stop instance {instance_id}: {outcome}")
+                failures.append(outcome)
                 continue
             results.append(outcome)
+
+        if failures:
+            # Every instance got its chance to stop -- that is why this is raised
+            # after they all settled rather than at the first failure -- but the
+            # caller must not be told the bulk delete succeeded when it did not.
+            raise ExceptionGroup(  # noqa: F821 (builtin since 3.11)
+                f"failed to stop {len(failures)} of {len(instance_ids)} instance(s)",
+                failures,
+            )
 
         return {
             "status": "all_stopped",
